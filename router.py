@@ -3,12 +3,9 @@ import http.server
 import json
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.request
-import webbrowser
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,330 +14,225 @@ HERE: Path = Path(__file__).resolve().parent
 PANEL_PATH: Path = HERE / "panel.html"
 WIN32_PATH: Path = HERE / "win32.py"
 
-
-def _print_usage() -> None:
-    sys.stdout.write(
-        "Usage: python router.py <scenario.py> [--select-region]\n"
-        "\n"
-        "Examples:\n"
-        "  python router.py chess.py\n"
-        "  python router.py chess.py --select-region\n"
-        "\n"
-        "The scenario file defines CONFIG, route(), run_cycle(),\n"
-        "and build_overlays(). See any example scenario for the template.\n"
-    )
-    sys.stdout.flush()
+CURSOR_ARM: int = 12
+CURSOR_LABEL_OFFSET: int = 18
+CURSOR_LABEL_LIMIT: int = 980
+CURSOR_FONT_SIZE: int = 11
+DEFAULT_CURSOR_POS: int = 500
+MIN_ANNOTATION_LENGTH: int = 100
+VLM_TIMEOUT: int = 120
+FALLBACK_SLEEP: float = 1.0
+ERROR_SLEEP: float = 2.0
+NO_RESIZE: int = 0
 
 
-def _load_scenario(filepath: Path) -> object:
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+
+
+def _load_module(name: str, filename: str) -> object:
     import importlib.util
-    spec: object = importlib.util.spec_from_file_location("scenario", str(filepath))
-    if spec is None:
-        raise ImportError(f"Cannot create module spec from {filepath}")
-    loader: object = getattr(spec, "loader", None)
-    if loader is None:
-        raise ImportError(f"No loader for {filepath}")
+    filepath: Path = HERE / filename
+    if not filepath.exists():
+        print(f"ERROR: {filename} not found")
+        raise SystemExit(1)
+    spec: object = importlib.util.spec_from_file_location(name, str(filepath))
     module: object = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader: object = getattr(spec, "loader", None)
     loader.exec_module(module)
     return module
 
 
-def _validate_scenario(module: object, filepath: Path) -> None:
-    missing: list[str] = []
-    for name in ("CONFIG", "route", "run_cycle", "build_overlays"):
-        if not hasattr(module, name):
-            missing.append(name)
-    if missing:
-        raise ImportError(
-            f"{filepath.name} is missing required attributes: {', '.join(missing)}\n"
-            f"Every scenario must define: CONFIG, route(), run_cycle(), build_overlays()"
-        )
-    config: object = getattr(module, "CONFIG")
-    for field_name in (
-        "vlm_endpoint_url", "vlm_model_name", "vlm_temperature", "vlm_top_p",
-        "vlm_max_tokens", "server_host", "server_port", "capture_region",
-        "capture_width", "capture_height", "capture_delay_seconds",
-        "system_prompt", "seed_vlm_text", "change_threshold",
-        "action_delay_seconds", "show_cursor",
-    ):
-        if not hasattr(config, field_name):
-            raise ImportError(
-                f"{filepath.name} CONFIG is missing field: {field_name}"
-            )
+_runtime_overrides: dict[str, object] = {}
 
 
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+def _cfg(brain: object, name: str, default: object) -> object:
+    if name in _runtime_overrides:
+        return _runtime_overrides[name]
+    return getattr(brain, name, default)
 
 
-def _utc_stamp() -> str:
-    return _utc_now().strftime("%Y%m%d_%H%M%S_%f")
-
-
-@dataclass
 class SessionLog:
-    session_dir: Path
-    turns_file: Path
+    def __init__(self, session_dir: Path, turns_file: Path) -> None:
+        self.session_dir: Path = session_dir
+        self.turns_file: Path = turns_file
 
     @staticmethod
     def create() -> "SessionLog":
         logs_root: Path = HERE / "logs"
         logs_root.mkdir(exist_ok=True)
-        session_name: str = _utc_stamp()
-        session_dir: Path = logs_root / session_name
+        session_dir: Path = logs_root / _utc_stamp()
         session_dir.mkdir(exist_ok=True)
-        turns_file: Path = session_dir / "turns.txt"
-        return SessionLog(session_dir=session_dir, turns_file=turns_file)
+        return SessionLog(session_dir=session_dir, turns_file=session_dir / "turns.txt")
 
-    def write_turn_input(self, turn: int, user_text: str) -> None:
-        stamp: str = _utc_stamp()
-        with self.turns_file.open("a", encoding="utf-8") as f:
-            f.write(f"--- TURN {turn} | {stamp} | INPUT ---\n")
-            f.write(user_text)
-            f.write("\n")
+    def write_turn(self, turn: int, label: str, text: str) -> None:
+        with self.turns_file.open("a", encoding="utf-8") as handle:
+            handle.write(f"--- TURN {turn} | {_utc_stamp()} | {label} ---\n{text}\n")
 
-    def write_turn_output(self, turn: int, vlm_output: str) -> None:
-        stamp: str = _utc_stamp()
-        with self.turns_file.open("a", encoding="utf-8") as f:
-            f.write(f"--- TURN {turn} | {stamp} | OUTPUT ---\n")
-            f.write(vlm_output)
-            f.write("\n")
-
-    def save_annotated_png(self, annotated_b64: str) -> None:
-        stamp: str = _utc_stamp()
-        png_path: Path = self.session_dir / f"{stamp}.png"
-        png_path.write_bytes(base64.b64decode(annotated_b64))
+    def save_png(self, data_b64: str) -> None:
+        (self.session_dir / f"{_utc_stamp()}.png").write_bytes(base64.b64decode(data_b64))
 
 
-@dataclass
 class ServerState:
-    phase: str = "init"
-    turn: int = 0
-    vlm_text: str = ""
-    raw_b64: str = ""
-    raw_seq: int = 0
-    overlays: list[dict[str, object]] = field(default_factory=list)
-    pending_seq: int = 0
-    annotated_seq: int = -1
-    annotated_b64: str = ""
-    annotated_ready: threading.Event = field(default_factory=threading.Event)
-    display_text: str = ""
-    display_actions: list[dict[str, object]] = field(default_factory=list)
-    error_text: str = ""
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    def __init__(self) -> None:
+        self.phase: str = "init"
+        self.turn: int = 0
+        self.raw_b64: str = ""
+        self.raw_seq: int = 0
+        self.overlays: list[dict[str, object]] = []
+        self.pending_seq: int = 0
+        self.annotated_seq: int = -1
+        self.annotated_b64: str = ""
+        self.annotated_ready: threading.Event = threading.Event()
+        self.display_text: str = ""
+        self.display_actions: list[dict[str, object]] = []
+        self.error_text: str = ""
+        self.lock: threading.Lock = threading.Lock()
 
 
 STATE: ServerState = ServerState()
-SESSION: SessionLog | None = None
 
 
-def _subprocess_capture(scenario_mod: object) -> str:
-    config: object = getattr(scenario_mod, "CONFIG")
-    cmd_args: list[str] = [sys.executable, str(WIN32_PATH), "capture"]
-    region: str = getattr(config, "capture_region", "")
+def _subprocess_capture(brain: object) -> str:
+    cmd: list[str] = [sys.executable, str(WIN32_PATH), "capture"]
+    region: str = str(_cfg(brain, "CAPTURE_REGION", ""))
     if region:
-        cmd_args.extend(["--region", region])
-    cmd_args.extend(["--width", str(getattr(config, "capture_width", 640))])
-    cmd_args.extend(["--height", str(getattr(config, "capture_height", 640))])
-    proc: subprocess.CompletedProcess[bytes] = subprocess.run(
-        cmd_args, capture_output=True
-    )
+        cmd.extend(["--region", region])
+    width: int = int(_cfg(brain, "CAPTURE_WIDTH", 640))
+    height: int = int(_cfg(brain, "CAPTURE_HEIGHT", 640))
+    cmd.extend(["--width", str(width)])
+    cmd.extend(["--height", str(height)])
+    proc: subprocess.CompletedProcess[bytes] = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0 or not proc.stdout:
         return ""
     return base64.b64encode(proc.stdout).decode("ascii")
 
 
-def _subprocess_cursor_pos(scenario_mod: object) -> tuple[int, int]:
-    config: object = getattr(scenario_mod, "CONFIG")
-    cmd_args: list[str] = [sys.executable, str(WIN32_PATH), "cursor_pos"]
-    region: str = getattr(config, "capture_region", "")
+def _subprocess_cursor_pos(brain: object) -> tuple[int, int]:
+    cmd: list[str] = [sys.executable, str(WIN32_PATH), "cursor_pos"]
+    region: str = str(_cfg(brain, "CAPTURE_REGION", ""))
     if region:
-        cmd_args.extend(["--region", region])
-    proc: subprocess.CompletedProcess[bytes] = subprocess.run(
-        cmd_args, capture_output=True
-    )
+        cmd.extend(["--region", region])
+    proc: subprocess.CompletedProcess[bytes] = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0 or not proc.stdout:
-        return 500, 500
+        return DEFAULT_CURSOR_POS, DEFAULT_CURSOR_POS
     parts: list[str] = proc.stdout.decode("ascii").strip().split(",")
     if len(parts) != 2:
-        return 500, 500
+        return DEFAULT_CURSOR_POS, DEFAULT_CURSOR_POS
     return int(parts[0]), int(parts[1])
 
 
-def _subprocess_execute(
-    actions: list[dict[str, object]],
-    scenario_mod: object,
-) -> list[tuple[int, int]]:
-    config: object = getattr(scenario_mod, "CONFIG")
-    region_arg: str = getattr(config, "capture_region", "")
-    action_delay: float = getattr(config, "action_delay_seconds", 0.3)
-
-    cursor_positions: list[tuple[int, int]] = []
-    cursor_positions.append(_subprocess_cursor_pos(scenario_mod))
-
-    drag_from: str = ""
-    executed_count: int = 0
-    for action in actions:
-        action_type_val: object = action.get("type", "")
-        if not isinstance(action_type_val, str):
-            continue
-        action_type: str = action_type_val
-        bbox_val: object = action.get("bbox_2d", [500, 500, 500, 500])
-        if not isinstance(bbox_val, list):
-            continue
-        bbox_list: list[int] = [int(v) for v in bbox_val]
-        if len(bbox_list) != 4:
-            continue
-        params_val: object = action.get("params", "")
-        params_str: str = str(params_val) if params_val else ""
-        bbox_str: str = f"{bbox_list[0]},{bbox_list[1]},{bbox_list[2]},{bbox_list[3]}"
-
-        cmd_args: list[str] = [sys.executable, str(WIN32_PATH)]
-
-        match action_type:
-            case "click":
-                cmd_args.extend(["click", "--bbox", bbox_str])
-            case "double_click":
-                cmd_args.extend(["double_click", "--bbox", bbox_str])
-            case "right_click":
-                cmd_args.extend(["right_click", "--bbox", bbox_str])
-            case "type":
-                cmd_args.extend(["type_text", "--text", params_str])
-            case "hotkey":
-                cmd_args.extend(["hotkey", "--keys", params_str])
-            case "key":
-                cmd_args.extend(["press_key", "--key", params_str])
-            case "scroll_up":
-                clicks_str: str = params_str if params_str.isdigit() else "3"
-                cmd_args.extend(["scroll_up", "--bbox", bbox_str, "--clicks", clicks_str])
-            case "scroll_down":
-                clicks_str = params_str if params_str.isdigit() else "3"
-                cmd_args.extend(["scroll_down", "--bbox", bbox_str, "--clicks", clicks_str])
-            case "drag_start":
-                drag_from = bbox_str
-                continue
-            case "drag_end":
-                if drag_from:
-                    drag_cmd: list[str] = [
-                        sys.executable, str(WIN32_PATH), "drag",
-                        "--from", drag_from, "--to", bbox_str,
-                    ]
-                    if region_arg:
-                        drag_cmd.extend(["--region", region_arg])
-                    subprocess.run(drag_cmd, capture_output=True)
-                    drag_from = ""
-                    cursor_positions.append(_subprocess_cursor_pos(scenario_mod))
-                continue
-            case _:
-                continue
-
-        if region_arg:
-            cmd_args.extend(["--region", region_arg])
-
-        if executed_count > 0:
-            time.sleep(action_delay)
-
-        subprocess.run(cmd_args, capture_output=True)
-        executed_count += 1
-        cursor_positions.append(_subprocess_cursor_pos(scenario_mod))
-
-    return cursor_positions
+def _action_xy_str(action: dict[str, object]) -> str:
+    x_val: int = int(action.get("x", DEFAULT_CURSOR_POS))
+    y_val: int = int(action.get("y", DEFAULT_CURSOR_POS))
+    return f"{x_val},{y_val}"
 
 
-def _subprocess_compare(png_a: bytes, png_b: bytes) -> float:
-    tmp_dir: str = tempfile.mkdtemp()
-    path_a: Path = Path(tmp_dir) / "frame_a.png"
-    path_b: Path = Path(tmp_dir) / "frame_b.png"
-    path_a.write_bytes(png_a)
-    path_b.write_bytes(png_b)
-    proc: subprocess.CompletedProcess[bytes] = subprocess.run(
-        [sys.executable, str(WIN32_PATH), "compare",
-         "--file_a", str(path_a), "--file_b", str(path_b)],
-        capture_output=True,
-    )
-    try:
-        path_a.unlink(missing_ok=True)
-        path_b.unlink(missing_ok=True)
-        Path(tmp_dir).rmdir()
-    except OSError:
-        pass
-    if proc.returncode != 0 or not proc.stdout:
-        return -1.0
-    try:
-        return float(proc.stdout.decode("ascii").strip())
-    except ValueError:
-        return -1.0
+def _subprocess_execute_one(action: dict[str, object], brain: object) -> None:
+    action_type: str = str(action.get("type", ""))
+    params_str: str = str(action.get("params", ""))
+    region: str = str(_cfg(brain, "CAPTURE_REGION", ""))
+    cmd: list[str] = [sys.executable, str(WIN32_PATH)]
+
+    match action_type:
+        case "click":
+            cmd.extend(["click", "--pos", _action_xy_str(action)])
+        case "double_click":
+            cmd.extend(["double_click", "--pos", _action_xy_str(action)])
+        case "right_click":
+            cmd.extend(["right_click", "--pos", _action_xy_str(action)])
+        case "type_text":
+            cmd.extend(["type_text", "--text", params_str])
+        case "press_key":
+            cmd.extend(["press_key", "--key", params_str])
+        case "hotkey":
+            cmd.extend(["hotkey", "--keys", params_str])
+        case "scroll_up":
+            cmd.extend(["scroll_up", "--pos", _action_xy_str(action)])
+        case "scroll_down":
+            cmd.extend(["scroll_down", "--pos", _action_xy_str(action)])
+        case _:
+            return
+
+    if region:
+        cmd.extend(["--region", region])
+    subprocess.run(cmd, capture_output=True)
 
 
-def _call_vlm(annotated_b64: str, user_text: str, scenario_mod: object) -> str:
-    config: object = getattr(scenario_mod, "CONFIG")
-    endpoint: str = getattr(config, "vlm_endpoint_url", "")
-    system_prompt: str = getattr(config, "system_prompt", "")
+def _subprocess_execute_drag(
+    from_action: dict[str, object], to_action: dict[str, object], brain: object,
+) -> None:
+    cmd: list[str] = [
+        sys.executable, str(WIN32_PATH), "drag",
+        "--from_pos", _action_xy_str(from_action),
+        "--to_pos", _action_xy_str(to_action),
+    ]
+    region: str = str(_cfg(brain, "CAPTURE_REGION", ""))
+    if region:
+        cmd.extend(["--region", region])
+    subprocess.run(cmd, capture_output=True)
 
-    user_content: list[dict[str, str | dict[str, str]]] = []
+
+def _call_vlm(image_b64: str, user_text: str, system_prompt: str, brain: object) -> str:
+    user_content: list[dict[str, object]] = []
     if user_text:
         user_content.append({"type": "text", "text": user_text})
     user_content.append({
         "type": "image_url",
-        "image_url": {"url": f"data:image/png;base64,{annotated_b64}"},
+        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
     })
-
-    messages: list[dict[str, str | list[dict[str, str | dict[str, str]]]]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
-
     body: bytes = json.dumps({
-        "model": getattr(config, "vlm_model_name", ""),
-        "temperature": getattr(config, "vlm_temperature", 0.6),
-        "top_p": getattr(config, "vlm_top_p", 0.85),
-        "max_tokens": getattr(config, "vlm_max_tokens", 800),
-        "messages": messages,
+        "model": str(_cfg(brain, "VLM_MODEL_NAME", "")),
+        "temperature": float(_cfg(brain, "VLM_TEMPERATURE", 0.6)),
+        "top_p": float(_cfg(brain, "VLM_TOP_P", 0.85)),
+        "max_tokens": int(_cfg(brain, "VLM_MAX_TOKENS", 800)),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
     }).encode("utf-8")
-
+    endpoint: str = str(_cfg(brain, "VLM_ENDPOINT_URL", ""))
     req: urllib.request.Request = urllib.request.Request(
         endpoint,
         data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            resp_data: bytes = resp.read()
-        resp_obj: object = json.loads(resp_data.decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=VLM_TIMEOUT) as resp:
+            resp_obj: object = json.loads(resp.read().decode("utf-8"))
         if isinstance(resp_obj, dict):
             choices: object = resp_obj.get("choices", [])
             if isinstance(choices, list) and len(choices) > 0:
-                first_choice: object = choices[0]
-                if isinstance(first_choice, dict):
-                    message: object = first_choice.get("message", {})
-                    if isinstance(message, dict):
-                        content: object = message.get("content", "")
+                first: object = choices[0]
+                if isinstance(first, dict):
+                    msg: object = first.get("message", {})
+                    if isinstance(msg, dict):
+                        content: object = msg.get("content", "")
                         if isinstance(content, str):
                             return content
-        return ""
     except Exception as exc:
         print(f"VLM error: {exc}", file=sys.stderr)
-        return ""
+    return ""
 
 
 def _make_cursor_overlay(cx: int, cy: int) -> dict[str, object]:
-    arm: int = 12
     return {
         "points": [
-            [cx - arm, cy], [cx + arm, cy],
-            [cx, cy], [cx, cy - arm], [cx, cy + arm],
+            [cx - CURSOR_ARM, cy], [cx + CURSOR_ARM, cy],
+            [cx, cy], [cx, cy - CURSOR_ARM], [cx, cy + CURSOR_ARM],
         ],
         "closed": False,
         "stroke": "#00ff00",
         "fill": "",
         "label": f"[{cx},{cy}]",
-        "label_position": [min(cx + 18, 980), min(cy + 18, 980)],
+        "label_position": [
+            min(cx + CURSOR_LABEL_OFFSET, CURSOR_LABEL_LIMIT),
+            min(cy + CURSOR_LABEL_OFFSET, CURSOR_LABEL_LIMIT),
+        ],
         "label_style": {
-            "font_size": 11,
+            "font_size": CURSOR_FONT_SIZE,
             "bg": "#000000",
             "color": "#00ff00",
             "align": "left",
@@ -348,63 +240,107 @@ def _make_cursor_overlay(cx: int, cy: int) -> dict[str, object]:
     }
 
 
-def _engine_loop(scenario_mod: object, session: SessionLog) -> None:
-    config: object = getattr(scenario_mod, "CONFIG")
-    run_cycle_fn: object = getattr(scenario_mod, "run_cycle")
-    build_overlays_fn: object = getattr(scenario_mod, "build_overlays")
-    change_threshold: float = getattr(config, "change_threshold", 0.01)
-    capture_delay: float = getattr(config, "capture_delay_seconds", 3.0)
-    show_cursor: bool = getattr(config, "show_cursor", True)
+def _engine_loop(brain: object, franz: object, session: SessionLog) -> None:
+    system_prompt: str = str(getattr(brain, "SYSTEM_PROMPT", ""))
+    on_vlm_response_fn: object = getattr(brain, "on_vlm_response")
+    flush_pipes_fn: object = getattr(franz, "_flush_pipes")
+    capture_delay: float = float(_cfg(brain, "CAPTURE_DELAY_SECONDS", 3.0))
+    action_delay: float = float(_cfg(brain, "ACTION_DELAY_SECONDS", 0.3))
+    show_cursor: bool = bool(_cfg(brain, "SHOW_CURSOR", True))
 
-    previous_response: str = getattr(config, "seed_vlm_text", "")
-    previous_overlays: list[dict[str, object]] = []
-    previous_png_bytes: bytes = b""
-    last_cursor_positions: list[tuple[int, int]] = []
+    previous_user_text: str = ""
+    last_cursor_pos: tuple[int, int] = (DEFAULT_CURSOR_POS, DEFAULT_CURSOR_POS)
 
-    def capture_fn() -> str:
-        nonlocal previous_png_bytes
+    while True:
+        with STATE.lock:
+            STATE.turn += 1
+            STATE.phase = "capturing"
+
         if capture_delay > 0:
             time.sleep(capture_delay)
-        raw_b64: str = _subprocess_capture(scenario_mod)
-        if raw_b64:
+        raw_b64: str = _subprocess_capture(brain)
+        if not raw_b64:
+            time.sleep(FALLBACK_SLEEP)
+            continue
+
+        with STATE.lock:
+            STATE.raw_b64 = raw_b64
+            STATE.raw_seq += 1
+            STATE.phase = "calling_vlm"
+
+        current_turn: int = STATE.turn
+        user_text_for_vlm: str = (
+            f"Previous: {previous_user_text}"
+            if previous_user_text
+            else "What do you see? What should you do?"
+        )
+        session.write_turn(current_turn, "INPUT", user_text_for_vlm)
+
+        vlm_response: str = _call_vlm(raw_b64, user_text_for_vlm, system_prompt, brain)
+        session.write_turn(current_turn, "OUTPUT", vlm_response)
+
+        if not vlm_response:
+            with STATE.lock:
+                STATE.phase = "error"
+                STATE.error_text = "VLM returned empty"
+            time.sleep(ERROR_SLEEP)
+            continue
+
+        with STATE.lock:
+            STATE.phase = "parsing"
+
+        try:
+            user_text_out: str = on_vlm_response_fn(vlm_response)
+        except Exception as exc:
+            print(f"on_vlm_response error: {exc}", file=sys.stderr)
+            user_text_out = vlm_response
+
+        pipe_actions: list[dict[str, object]]
+        pipe_overlays: list[dict[str, object]]
+        pipe_actions, pipe_overlays = flush_pipes_fn()
+
+        with STATE.lock:
+            STATE.display_text = vlm_response
+            STATE.display_actions = list(pipe_actions)
+            STATE.phase = "executing"
+
+        executed_count: int = 0
+        pending_drag: dict[str, object] | None = None
+        for action in pipe_actions:
+            action_type: str = str(action.get("type", ""))
+            if action_type == "drag_start":
+                pending_drag = action
+                continue
+            if action_type == "drag_end" and pending_drag is not None:
+                _subprocess_execute_drag(pending_drag, action, brain)
+                pending_drag = None
+                last_cursor_pos = _subprocess_cursor_pos(brain)
+                continue
+            if executed_count > 0:
+                time.sleep(action_delay)
+            _subprocess_execute_one(action, brain)
+            executed_count += 1
+            last_cursor_pos = _subprocess_cursor_pos(brain)
+
+        with STATE.lock:
+            STATE.phase = "annotating"
+
+        if capture_delay > 0:
+            time.sleep(capture_delay)
+        post_b64: str = _subprocess_capture(brain)
+        if post_b64:
+            raw_b64 = post_b64
             with STATE.lock:
                 STATE.raw_b64 = raw_b64
                 STATE.raw_seq += 1
-        return raw_b64
 
-    def execute_fn(actions: list[dict[str, object]]) -> None:
-        nonlocal last_cursor_positions
-        with STATE.lock:
-            STATE.display_actions = list(actions)
-            STATE.phase = "executing"
-        last_cursor_positions = _subprocess_execute(actions, scenario_mod)
-
-    def annotate_fn(screenshot_b64: str, overlays: list[dict[str, object]]) -> str:
-        nonlocal previous_png_bytes
-        if not screenshot_b64:
-            return ""
-
-        current_png_bytes: bytes = base64.b64decode(screenshot_b64)
-        change_ratio: float = -1.0
-        if previous_png_bytes:
-            change_ratio = _subprocess_compare(previous_png_bytes, current_png_bytes)
-        previous_png_bytes = current_png_bytes
-        screen_changed: bool = change_ratio >= change_threshold if change_ratio >= 0 else True
-
-        route_result_actions: list[dict[str, object]] = []
-        with STATE.lock:
-            route_result_actions = list(STATE.display_actions)
-
-        final_overlays: list[dict[str, object]] = build_overlays_fn(
-            route_result_actions, screen_changed, overlays
-        )
-
-        if show_cursor and last_cursor_positions:
-            final_cx, final_cy = last_cursor_positions[-1]
-            final_overlays.append(_make_cursor_overlay(final_cx, final_cy))
+        final_overlays: list[dict[str, object]] = list(pipe_overlays)
+        if show_cursor:
+            final_overlays.append(
+                _make_cursor_overlay(last_cursor_pos[0], last_cursor_pos[1])
+            )
 
         with STATE.lock:
-            current_turn: int = STATE.turn
             STATE.overlays = final_overlays
             STATE.pending_seq = current_turn
             STATE.annotated_seq = -1
@@ -415,66 +351,13 @@ def _engine_loop(scenario_mod: object, session: SessionLog) -> None:
         STATE.annotated_ready.wait()
 
         with STATE.lock:
-            result_b64: str = STATE.annotated_b64
+            annotated_result: str = STATE.annotated_b64
 
-        session.save_annotated_png(result_b64)
+        session.save_png(annotated_result)
+        previous_user_text = user_text_out if isinstance(user_text_out, str) else vlm_response
 
-        return result_b64
-
-    def call_vlm_fn(annotated_b64: str, user_text: str) -> str:
         with STATE.lock:
-            STATE.phase = "calling_vlm"
-            current_turn: int = STATE.turn
-        session.write_turn_input(current_turn, user_text)
-        result: str = _call_vlm(annotated_b64, user_text, scenario_mod)
-        session.write_turn_output(current_turn, result)
-        return result
-
-    while True:
-        with STATE.lock:
-            STATE.turn += 1
-            STATE.phase = "running"
-
-        try:
-            result_holder: object = run_cycle_fn(
-                previous_response,
-                previous_overlays,
-                capture_fn,
-                execute_fn,
-                annotate_fn,
-                call_vlm_fn,
-            )
-
-            next_response: str = ""
-            next_overlays: list[dict[str, object]] = []
-
-            if isinstance(result_holder, tuple) and len(result_holder) == 2:
-                next_response = str(result_holder[0])
-                next_overlays_raw: object = result_holder[1]
-                next_overlays = next_overlays_raw if isinstance(next_overlays_raw, list) else []
-            else:
-                next_response = str(result_holder) if result_holder else ""
-
-            if not next_response:
-                with STATE.lock:
-                    STATE.phase = "error"
-                    STATE.error_text = "VLM returned empty response"
-                time.sleep(1.0)
-                next_response = previous_response
-
-            with STATE.lock:
-                STATE.vlm_text = next_response
-                STATE.display_text = next_response
-
-            previous_response = next_response
-            previous_overlays = next_overlays
-
-        except Exception as exc:
-            with STATE.lock:
-                STATE.phase = "error"
-                STATE.error_text = str(exc)
-            print(f"Engine error: {exc}", file=sys.stderr)
-            time.sleep(2.0)
+            STATE.phase = "idle"
 
 
 class FranzHandler(http.server.BaseHTTPRequestHandler):
@@ -506,11 +389,9 @@ class FranzHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path: str = self.path.split("?", 1)[0]
-
         match path:
             case "/" | "/index.html":
                 self._send_html(200, PANEL_PATH.read_bytes())
-
             case "/state":
                 with STATE.lock:
                     self._send_json(200, {
@@ -527,7 +408,6 @@ class FranzHandler(http.server.BaseHTTPRequestHandler):
                         },
                         "msg_id": STATE.turn,
                     })
-
             case "/frame":
                 with STATE.lock:
                     self._send_json(200, {
@@ -535,7 +415,6 @@ class FranzHandler(http.server.BaseHTTPRequestHandler):
                         "raw_b64": STATE.raw_b64,
                         "overlays": STATE.overlays,
                     })
-
             case _:
                 self._send_json(404, {"error": "not found"})
 
@@ -543,40 +422,31 @@ class FranzHandler(http.server.BaseHTTPRequestHandler):
         path: str = self.path.split("?", 1)[0]
         content_length: int = int(self.headers.get("Content-Length", "0"))
         body: bytes = self.rfile.read(content_length) if content_length > 0 else b""
-
         match path:
             case "/annotated":
-                parsed_body: object = None
                 try:
-                    parsed_body = json.loads(body.decode("utf-8"))
+                    parsed: object = json.loads(body.decode("utf-8"))
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     self._send_json(400, {"ok": False, "err": "bad json"})
                     return
-
-                if not isinstance(parsed_body, dict):
+                if not isinstance(parsed, dict):
                     self._send_json(400, {"ok": False, "err": "bad json"})
                     return
-
-                seq_val: object = parsed_body.get("seq")
-                img_val: object = parsed_body.get("image_b64", "")
-
+                seq_val: object = parsed.get("seq")
+                img_val: object = parsed.get("image_b64", "")
                 with STATE.lock:
-                    expected_seq: int = STATE.pending_seq
-
-                if seq_val != expected_seq:
+                    expected: int = STATE.pending_seq
+                if seq_val != expected:
                     self._send_json(409, {"ok": False, "err": "seq mismatch"})
                     return
-
-                if not isinstance(img_val, str) or len(img_val) < 100:
+                if not isinstance(img_val, str) or len(img_val) < MIN_ANNOTATION_LENGTH:
                     self._send_json(400, {"ok": False, "err": "image too short"})
                     return
-
                 with STATE.lock:
                     STATE.annotated_b64 = img_val
-                    STATE.annotated_seq = expected_seq
+                    STATE.annotated_seq = expected
                 STATE.annotated_ready.set()
-                self._send_json(200, {"ok": True, "seq": expected_seq})
-
+                self._send_json(200, {"ok": True, "seq": expected})
             case _:
                 self._send_json(404, {"error": "not found"})
 
@@ -589,97 +459,68 @@ class FranzHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 
-def _run_select_region() -> str:
+def _run_select_region() -> tuple[str, int]:
     proc: subprocess.CompletedProcess[bytes] = subprocess.run(
         [sys.executable, str(WIN32_PATH), "select_region"],
         capture_output=True,
     )
+    if proc.returncode == 2:
+        return "", 2
     if proc.returncode != 0 or not proc.stdout:
-        return ""
-    return proc.stdout.decode("ascii").strip()
+        return "", proc.returncode
+    return proc.stdout.decode("ascii").strip(), 0
 
 
 def main() -> None:
-    global SESSION
+    franz: object = _load_module("franz", "franz.py")
+    brain: object = _load_module("brain", "brain.py")
 
-    if len(sys.argv) < 2:
-        _print_usage()
-        raise SystemExit(1)
-
-    select_region_mode: bool = "--select-region" in sys.argv
-
-    scenario_filename: str = ""
-    for arg in sys.argv[1:]:
-        if not arg.startswith("--"):
-            scenario_filename = arg
-            break
-
-    if not scenario_filename:
-        _print_usage()
-        raise SystemExit(1)
-
-    if select_region_mode:
-        print("Launching region selector... Draw a rectangle on screen.")
-        coords: str = _run_select_region()
-        if coords:
-            print(f"Selected region: {coords}")
-            print(f"Set capture_region = \"{coords}\" in your brain CONFIG.")
-        else:
-            print("Region selection cancelled.")
-        raise SystemExit(0)
-
-    scenario_path: Path = HERE / scenario_filename
-    if not scenario_path.exists():
-        abs_path: Path = Path(scenario_filename).resolve()
-        if abs_path.exists():
-            scenario_path = abs_path
-        else:
-            print(f"ERROR: Scenario file not found: {scenario_filename}")
+    for name in ("SYSTEM_PROMPT", "on_vlm_response"):
+        if not hasattr(brain, name):
+            print(f"ERROR: brain.py missing: {name}")
             raise SystemExit(1)
 
-    print(f"Loading {scenario_path.name}...")
-    try:
-        scenario_mod: object = _load_scenario(scenario_path)
-    except Exception as exc:
-        print(f"ERROR: Failed to load {scenario_path.name}:")
-        print(f"  {exc}")
+    if not hasattr(franz, "_flush_pipes"):
+        print("ERROR: franz.py missing: _flush_pipes")
         raise SystemExit(1)
 
-    try:
-        _validate_scenario(scenario_mod, scenario_path)
-    except ImportError as exc:
-        print(f"ERROR: {exc}")
-        raise SystemExit(1)
+    print("Select capture region (drag), right-click for full screen, Escape to quit.")
+    region_str, exit_code = _run_select_region()
 
-    config: object = getattr(scenario_mod, "CONFIG")
-    host: str = getattr(config, "server_host", "127.0.0.1")
-    port: int = getattr(config, "server_port", 1234)
+    if exit_code == 2:
+        print("Cancelled.")
+        raise SystemExit(0)
 
-    SESSION = SessionLog.create()
+    if region_str:
+        print(f"Region selected: {region_str}")
+        _runtime_overrides["CAPTURE_REGION"] = region_str
+        _runtime_overrides["CAPTURE_WIDTH"] = NO_RESIZE
+        _runtime_overrides["CAPTURE_HEIGHT"] = NO_RESIZE
+    else:
+        print("Full screen mode.")
+        _runtime_overrides["CAPTURE_REGION"] = ""
+
+    session: SessionLog = SessionLog.create()
+    host: str = str(_cfg(brain, "SERVER_HOST", "127.0.0.1"))
+    port: int = int(_cfg(brain, "SERVER_PORT", 1234))
 
     print(f"Franz starting on http://{host}:{port}")
-    print(f"VLM endpoint: {getattr(config, 'vlm_endpoint_url', '?')}")
-    print(f"Capture region: {getattr(config, 'capture_region', '') or 'full screen'}")
-    print(f"Capture size: {getattr(config, 'capture_width', 640)}x{getattr(config, 'capture_height', 640)}")
-    print(f"Session log: {SESSION.session_dir}")
-    print(f"Scenario: {scenario_path.name}")
+    print(f"VLM: {_cfg(brain, 'VLM_ENDPOINT_URL', '?')}")
+    print(f"Region: {_cfg(brain, 'CAPTURE_REGION', '') or 'full screen'}")
+    print(f"Session: {session.session_dir}")
 
-    engine_thread: threading.Thread = threading.Thread(
-        target=_engine_loop, args=(scenario_mod, SESSION), daemon=True
+    engine: threading.Thread = threading.Thread(
+        target=_engine_loop, args=(brain, franz, session), daemon=True,
     )
-    engine_thread.start()
+    engine.start()
 
-    server: http.server.HTTPServer = http.server.HTTPServer(
-        (host, port), FranzHandler
-    )
-    print(f"Server running at http://{host}:{port}")
-
-    webbrowser.open(f"http://{host}:{port}")
+    server: http.server.HTTPServer = http.server.HTTPServer((host, port), FranzHandler)
+    print(f"Running at http://{host}:{port}")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\nStopping.")
         server.shutdown()
 
 
