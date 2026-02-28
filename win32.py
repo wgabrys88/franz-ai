@@ -11,7 +11,6 @@ from dataclasses import dataclass
 class Win32Config:
     drag_step_count: int = 25
     drag_step_delay: float = 0.008
-    action_delay: float = 0.15
     default_capture_width: int = 640
     default_capture_height: int = 640
     click_settle_delay: float = 0.03
@@ -161,6 +160,8 @@ def _setup_bindings() -> None:
     _user32.mouse_event.restype = None
     _user32.keybd_event.argtypes = [W.BYTE, W.BYTE, W.DWORD, ctypes.POINTER(ctypes.c_ulong)]
     _user32.keybd_event.restype = None
+    _user32.GetCursorPos.argtypes = [ctypes.POINTER(W.POINT)]
+    _user32.GetCursorPos.restype = W.BOOL
     _kernel32.GetModuleHandleW.argtypes = [W.LPCWSTR]
     _kernel32.GetModuleHandleW.restype = HMODULE
     _user32.LoadCursorW.argtypes = [W.HINSTANCE, W.LPCWSTR]
@@ -314,6 +315,23 @@ def _norm_to_screen_pixel(
     pixel_x: int = px_x1 + (clamped_x * (crop_w - 1) + NORM // 2) // NORM if crop_w > 1 else px_x1
     pixel_y: int = px_y1 + (clamped_y * (crop_h - 1) + NORM // 2) // NORM if crop_h > 1 else px_y1
     return pixel_x, pixel_y
+
+
+def _screen_pixel_to_norm(
+    pixel_x: int, pixel_y: int,
+    region_x1: int, region_y1: int, region_x2: int, region_y2: int,
+) -> tuple[int, int]:
+    screen_w, screen_h = _screen_size()
+    px_x1, px_y1, px_x2, px_y2 = _norm_region_to_pixels(
+        region_x1, region_y1, region_x2, region_y2, screen_w, screen_h
+    )
+    crop_w: int = max(1, px_x2 - px_x1)
+    crop_h: int = max(1, px_y2 - px_y1)
+    rel_x: int = pixel_x - px_x1
+    rel_y: int = pixel_y - px_y1
+    norm_x: int = _clamp_norm((rel_x * NORM + crop_w // 2) // crop_w) if crop_w > 1 else 500
+    norm_y: int = _clamp_norm((rel_y * NORM + crop_h // 2) // crop_h) if crop_h > 1 else 500
+    return norm_x, norm_y
 
 
 def _crop_bgra(
@@ -600,6 +618,17 @@ def _do_compare(file_a: str, file_b: str) -> float:
     return (diff / total) if total else -1.0
 
 
+def _do_cursor_pos(region_str: str) -> str:
+    point: W.POINT = W.POINT()
+    _user32.GetCursorPos(ctypes.byref(point))
+    if region_str:
+        rx1, ry1, rx2, ry2 = _parse_region(region_str)
+    else:
+        rx1, ry1, rx2, ry2 = 0, 0, NORM, NORM
+    norm_x, norm_y = _screen_pixel_to_norm(point.x, point.y, rx1, ry1, rx2, ry2)
+    return f"{norm_x},{norm_y}"
+
+
 _selector_dragging: bool = False
 _selector_sx: int = 0
 _selector_sy: int = 0
@@ -715,8 +744,6 @@ def _do_select_region() -> str:
     _selector_result = None
 
     _selector_screen_w, _selector_screen_h = _screen_size()
-    if _selector_screen_w <= 0 or _selector_screen_h <= 0:
-        _selector_screen_w, _selector_screen_h = 1920, 1080
 
     _selector_null_brush = _gdi32.GetStockObject(NULL_BRUSH)
 
@@ -853,8 +880,14 @@ def main() -> None:
             sys.stdout.write(f"{ratio:.6f}\n")
             sys.stdout.flush()
 
+        case "cursor_pos":
+            region_val = get_arg("region", "")
+            coords: str = _do_cursor_pos(region_val)
+            sys.stdout.write(coords + "\n")
+            sys.stdout.flush()
+
         case "select_region":
-            coords: str = _do_select_region()
+            coords = _do_select_region()
             if coords:
                 sys.stdout.write(coords + "\n")
                 sys.stdout.flush()
