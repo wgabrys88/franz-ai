@@ -9,6 +9,7 @@ import time
 import urllib.request
 import webbrowser
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -19,12 +20,11 @@ WIN32_PATH: Path = HERE / "win32.py"
 
 def _print_usage() -> None:
     sys.stdout.write(
-        "Usage: python router.py <scenario.py>\n"
+        "Usage: python router.py <scenario.py> [--select-region]\n"
         "\n"
         "Examples:\n"
         "  python router.py chess.py\n"
-        "  python router.py paint_cat.py\n"
-        "  python router.py test_tools.py\n"
+        "  python router.py chess.py --select-region\n"
         "\n"
         "The scenario file defines CONFIG, route(), run_cycle(),\n"
         "and build_overlays(). See any example scenario for the template.\n"
@@ -61,11 +61,55 @@ def _validate_scenario(module: object, filepath: Path) -> None:
         "vlm_max_tokens", "server_host", "server_port", "capture_region",
         "capture_width", "capture_height", "capture_delay_seconds",
         "system_prompt", "seed_vlm_text", "change_threshold",
+        "action_delay_seconds", "show_cursor",
     ):
         if not hasattr(config, field_name):
             raise ImportError(
                 f"{filepath.name} CONFIG is missing field: {field_name}"
             )
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_stamp() -> str:
+    return _utc_now().strftime("%Y%m%d_%H%M%S_%f")
+
+
+@dataclass
+class SessionLog:
+    session_dir: Path
+    turns_file: Path
+
+    @staticmethod
+    def create() -> "SessionLog":
+        logs_root: Path = HERE / "logs"
+        logs_root.mkdir(exist_ok=True)
+        session_name: str = _utc_stamp()
+        session_dir: Path = logs_root / session_name
+        session_dir.mkdir(exist_ok=True)
+        turns_file: Path = session_dir / "turns.txt"
+        return SessionLog(session_dir=session_dir, turns_file=turns_file)
+
+    def write_turn_input(self, turn: int, user_text: str) -> None:
+        stamp: str = _utc_stamp()
+        with self.turns_file.open("a", encoding="utf-8") as f:
+            f.write(f"--- TURN {turn} | {stamp} | INPUT ---\n")
+            f.write(user_text)
+            f.write("\n")
+
+    def write_turn_output(self, turn: int, vlm_output: str) -> None:
+        stamp: str = _utc_stamp()
+        with self.turns_file.open("a", encoding="utf-8") as f:
+            f.write(f"--- TURN {turn} | {stamp} | OUTPUT ---\n")
+            f.write(vlm_output)
+            f.write("\n")
+
+    def save_annotated_png(self, annotated_b64: str) -> None:
+        stamp: str = _utc_stamp()
+        png_path: Path = self.session_dir / f"{stamp}.png"
+        png_path.write_bytes(base64.b64decode(annotated_b64))
 
 
 @dataclass
@@ -87,6 +131,7 @@ class ServerState:
 
 
 STATE: ServerState = ServerState()
+SESSION: SessionLog | None = None
 
 
 def _subprocess_capture(scenario_mod: object) -> str:
@@ -105,11 +150,36 @@ def _subprocess_capture(scenario_mod: object) -> str:
     return base64.b64encode(proc.stdout).decode("ascii")
 
 
-def _subprocess_execute(actions: list[dict[str, object]], scenario_mod: object) -> None:
+def _subprocess_cursor_pos(scenario_mod: object) -> tuple[int, int]:
+    config: object = getattr(scenario_mod, "CONFIG")
+    cmd_args: list[str] = [sys.executable, str(WIN32_PATH), "cursor_pos"]
+    region: str = getattr(config, "capture_region", "")
+    if region:
+        cmd_args.extend(["--region", region])
+    proc: subprocess.CompletedProcess[bytes] = subprocess.run(
+        cmd_args, capture_output=True
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return 500, 500
+    parts: list[str] = proc.stdout.decode("ascii").strip().split(",")
+    if len(parts) != 2:
+        return 500, 500
+    return int(parts[0]), int(parts[1])
+
+
+def _subprocess_execute(
+    actions: list[dict[str, object]],
+    scenario_mod: object,
+) -> list[tuple[int, int]]:
     config: object = getattr(scenario_mod, "CONFIG")
     region_arg: str = getattr(config, "capture_region", "")
+    action_delay: float = getattr(config, "action_delay_seconds", 0.3)
+
+    cursor_positions: list[tuple[int, int]] = []
+    cursor_positions.append(_subprocess_cursor_pos(scenario_mod))
 
     drag_from: str = ""
+    executed_count: int = 0
     for action in actions:
         action_type_val: object = action.get("type", "")
         if not isinstance(action_type_val, str):
@@ -159,6 +229,7 @@ def _subprocess_execute(actions: list[dict[str, object]], scenario_mod: object) 
                         drag_cmd.extend(["--region", region_arg])
                     subprocess.run(drag_cmd, capture_output=True)
                     drag_from = ""
+                    cursor_positions.append(_subprocess_cursor_pos(scenario_mod))
                 continue
             case _:
                 continue
@@ -166,7 +237,14 @@ def _subprocess_execute(actions: list[dict[str, object]], scenario_mod: object) 
         if region_arg:
             cmd_args.extend(["--region", region_arg])
 
+        if executed_count > 0:
+            time.sleep(action_delay)
+
         subprocess.run(cmd_args, capture_output=True)
+        executed_count += 1
+        cursor_positions.append(_subprocess_cursor_pos(scenario_mod))
+
+    return cursor_positions
 
 
 def _subprocess_compare(png_a: bytes, png_b: bytes) -> float:
@@ -249,16 +327,39 @@ def _call_vlm(annotated_b64: str, user_text: str, scenario_mod: object) -> str:
         return ""
 
 
-def _engine_loop(scenario_mod: object) -> None:
+def _make_cursor_overlay(cx: int, cy: int) -> dict[str, object]:
+    arm: int = 12
+    return {
+        "points": [
+            [cx - arm, cy], [cx + arm, cy],
+            [cx, cy], [cx, cy - arm], [cx, cy + arm],
+        ],
+        "closed": False,
+        "stroke": "#00ff00",
+        "fill": "",
+        "label": f"[{cx},{cy}]",
+        "label_position": [min(cx + 18, 980), min(cy + 18, 980)],
+        "label_style": {
+            "font_size": 11,
+            "bg": "#000000",
+            "color": "#00ff00",
+            "align": "left",
+        },
+    }
+
+
+def _engine_loop(scenario_mod: object, session: SessionLog) -> None:
     config: object = getattr(scenario_mod, "CONFIG")
     run_cycle_fn: object = getattr(scenario_mod, "run_cycle")
     build_overlays_fn: object = getattr(scenario_mod, "build_overlays")
     change_threshold: float = getattr(config, "change_threshold", 0.01)
     capture_delay: float = getattr(config, "capture_delay_seconds", 3.0)
+    show_cursor: bool = getattr(config, "show_cursor", True)
 
     previous_response: str = getattr(config, "seed_vlm_text", "")
     previous_overlays: list[dict[str, object]] = []
     previous_png_bytes: bytes = b""
+    last_cursor_positions: list[tuple[int, int]] = []
 
     def capture_fn() -> str:
         nonlocal previous_png_bytes
@@ -272,10 +373,11 @@ def _engine_loop(scenario_mod: object) -> None:
         return raw_b64
 
     def execute_fn(actions: list[dict[str, object]]) -> None:
+        nonlocal last_cursor_positions
         with STATE.lock:
             STATE.display_actions = list(actions)
             STATE.phase = "executing"
-        _subprocess_execute(actions, scenario_mod)
+        last_cursor_positions = _subprocess_execute(actions, scenario_mod)
 
     def annotate_fn(screenshot_b64: str, overlays: list[dict[str, object]]) -> str:
         nonlocal previous_png_bytes
@@ -297,6 +399,10 @@ def _engine_loop(scenario_mod: object) -> None:
             route_result_actions, screen_changed, overlays
         )
 
+        if show_cursor and last_cursor_positions:
+            final_cx, final_cy = last_cursor_positions[-1]
+            final_overlays.append(_make_cursor_overlay(final_cx, final_cy))
+
         with STATE.lock:
             current_turn: int = STATE.turn
             STATE.overlays = final_overlays
@@ -309,12 +415,20 @@ def _engine_loop(scenario_mod: object) -> None:
         STATE.annotated_ready.wait()
 
         with STATE.lock:
-            return STATE.annotated_b64
+            result_b64: str = STATE.annotated_b64
+
+        session.save_annotated_png(result_b64)
+
+        return result_b64
 
     def call_vlm_fn(annotated_b64: str, user_text: str) -> str:
         with STATE.lock:
             STATE.phase = "calling_vlm"
-        return _call_vlm(annotated_b64, user_text, scenario_mod)
+            current_turn: int = STATE.turn
+        session.write_turn_input(current_turn, user_text)
+        result: str = _call_vlm(annotated_b64, user_text, scenario_mod)
+        session.write_turn_output(current_turn, result)
+        return result
 
     while True:
         with STATE.lock:
@@ -395,10 +509,7 @@ class FranzHandler(http.server.BaseHTTPRequestHandler):
 
         match path:
             case "/" | "/index.html":
-                if PANEL_PATH.exists():
-                    self._send_html(200, PANEL_PATH.read_bytes())
-                else:
-                    self._send_json(404, {"error": "panel.html not found"})
+                self._send_html(200, PANEL_PATH.read_bytes())
 
             case "/state":
                 with STATE.lock:
@@ -412,12 +523,9 @@ class FranzHandler(http.server.BaseHTTPRequestHandler):
                         "text": STATE.display_text,
                         "display": {
                             "text": STATE.display_text,
-                            "regions": [],
                             "actions": STATE.display_actions,
-                            "parse_error": "",
                         },
                         "msg_id": STATE.turn,
-                        "parse_error": "",
                     })
 
             case "/frame":
@@ -481,21 +589,52 @@ class FranzHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 
+def _run_select_region() -> str:
+    proc: subprocess.CompletedProcess[bytes] = subprocess.run(
+        [sys.executable, str(WIN32_PATH), "select_region"],
+        capture_output=True,
+    )
+    if proc.returncode != 0 or not proc.stdout:
+        return ""
+    return proc.stdout.decode("ascii").strip()
+
+
 def main() -> None:
+    global SESSION
+
     if len(sys.argv) < 2:
         _print_usage()
         raise SystemExit(1)
 
-    scenario_filename: str = sys.argv[1]
-    scenario_path: Path = HERE / scenario_filename
+    select_region_mode: bool = "--select-region" in sys.argv
 
+    scenario_filename: str = ""
+    for arg in sys.argv[1:]:
+        if not arg.startswith("--"):
+            scenario_filename = arg
+            break
+
+    if not scenario_filename:
+        _print_usage()
+        raise SystemExit(1)
+
+    if select_region_mode:
+        print("Launching region selector... Draw a rectangle on screen.")
+        coords: str = _run_select_region()
+        if coords:
+            print(f"Selected region: {coords}")
+            print(f"Set capture_region = \"{coords}\" in your brain CONFIG.")
+        else:
+            print("Region selection cancelled.")
+        raise SystemExit(0)
+
+    scenario_path: Path = HERE / scenario_filename
     if not scenario_path.exists():
         abs_path: Path = Path(scenario_filename).resolve()
         if abs_path.exists():
             scenario_path = abs_path
         else:
             print(f"ERROR: Scenario file not found: {scenario_filename}")
-            print(f"Looked in: {HERE}")
             raise SystemExit(1)
 
     print(f"Loading {scenario_path.name}...")
@@ -504,7 +643,6 @@ def main() -> None:
     except Exception as exc:
         print(f"ERROR: Failed to load {scenario_path.name}:")
         print(f"  {exc}")
-        print(f"Fix {scenario_path.name} and restart.")
         raise SystemExit(1)
 
     try:
@@ -517,14 +655,17 @@ def main() -> None:
     host: str = getattr(config, "server_host", "127.0.0.1")
     port: int = getattr(config, "server_port", 1234)
 
+    SESSION = SessionLog.create()
+
     print(f"Franz starting on http://{host}:{port}")
     print(f"VLM endpoint: {getattr(config, 'vlm_endpoint_url', '?')}")
     print(f"Capture region: {getattr(config, 'capture_region', '') or 'full screen'}")
     print(f"Capture size: {getattr(config, 'capture_width', 640)}x{getattr(config, 'capture_height', 640)}")
+    print(f"Session log: {SESSION.session_dir}")
     print(f"Scenario: {scenario_path.name}")
 
     engine_thread: threading.Thread = threading.Thread(
-        target=_engine_loop, args=(scenario_mod,), daemon=True
+        target=_engine_loop, args=(scenario_mod, SESSION), daemon=True
     )
     engine_thread.start()
 
