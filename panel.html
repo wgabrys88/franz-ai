@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Franz</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+--bg:#0d0d0f;--surface:#16161a;--border:#2a2a35;
+--accent:#4a9eff;--accent2:#ff6b35;
+--text:#e8e8f0;--text-dim:#6b6b80;--text-mid:#a0a0b8;
+--ok:#3ecf8e;--warn:#f0a000;--err:#ff4455;
+--radius:8px;--mono:"Cascadia Code","Fira Code","Consolas",monospace;
+--split-x:62%;--split-y:55%
+}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;font-size:13px}
+#root{display:grid;width:100vw;height:calc(100vh - 22px);grid-template-columns:var(--split-x) 4px 1fr;grid-template-rows:var(--split-y) 4px 1fr}
+#gutter-v{grid-column:2;grid-row:1/4;background:var(--border);cursor:col-resize;transition:background .15s;z-index:10}
+#gutter-v:hover{background:var(--accent)}
+#gutter-h{grid-column:3;grid-row:2;background:var(--border);cursor:row-resize;transition:background .15s;z-index:10}
+#gutter-h:hover{background:var(--accent)}
+#cross{grid-column:2;grid-row:2;background:var(--accent);cursor:move;z-index:20;border-radius:2px}
+#pane-canvas{grid-column:1;grid-row:1/4;overflow:hidden;position:relative}
+#pane-vlm{grid-column:3;grid-row:1;overflow:hidden;display:flex;flex-direction:column}
+#pane-log{grid-column:3;grid-row:3;overflow:hidden;display:flex;flex-direction:column}
+.pane-header{display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--surface);border-bottom:1px solid var(--border);flex-shrink:0;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-dim)}
+.pane-header .badge{margin-left:auto;padding:1px 7px;border-radius:20px;font-size:10px;font-weight:700;letter-spacing:.04em;background:var(--border);color:var(--text-mid)}
+.pane-header .badge.ok{background:#1a3d2e;color:var(--ok)}
+.pane-header .badge.warn{background:#3d2e00;color:var(--warn)}
+.pane-header .badge.err{background:#3d0a10;color:var(--err)}
+.pane-body{flex:1;overflow:auto;padding:10px;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+#canvas-wrap{width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:#080809;position:relative}
+#canvas-stack{position:relative}
+#canvas-stack canvas{position:absolute;top:0;left:0}
+#c-base{position:relative;display:block}
+#c-overlay{pointer-events:none}
+.canvas-status{position:absolute;bottom:8px;right:10px;font-size:10px;color:var(--text-dim);font-family:var(--mono);pointer-events:none}
+#vlm-output{font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--text-mid);white-space:pre-wrap;word-break:break-word}
+#log-list{font-family:var(--mono);font-size:11px;line-height:1.5;list-style:none}
+#log-list li{padding:1px 0;border-bottom:1px solid #1a1a20}
+#log-list li.info{color:var(--text-dim)}
+#log-list li.ok{color:var(--ok)}
+#log-list li.warn{color:var(--warn)}
+#log-list li.error{color:var(--err)}
+#log-list li time{color:#3a3a50;margin-right:6px}
+#statusbar{position:fixed;bottom:0;left:0;right:0;height:22px;line-height:22px;background:var(--surface);border-top:1px solid var(--border);display:flex;gap:0;font-size:11px;z-index:100}
+.sb-item{padding:0 12px;border-right:1px solid var(--border);color:var(--text-dim)}
+.sb-item span{color:var(--text-mid)}
+.sb-phase{color:var(--accent)!important}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#44445a}
+</style>
+</head>
+<body>
+<div id="root">
+<div id="pane-canvas">
+<div class="pane-header">Annotated View<span class="badge" id="badge-img">--</span></div>
+<div id="canvas-wrap">
+<div id="canvas-stack">
+<canvas id="c-base"></canvas>
+<canvas id="c-overlay"></canvas>
+</div>
+<div class="canvas-status" id="canvas-status">no frame</div>
+</div>
+</div>
+<div id="gutter-v"></div>
+<div id="pane-vlm">
+<div class="pane-header">VLM Output<span class="badge" id="badge-turn">turn 0</span></div>
+<div class="pane-body"><div id="vlm-output">Waiting...</div></div>
+</div>
+<div id="cross"></div>
+<div id="gutter-h"></div>
+<div id="pane-log">
+<div class="pane-header">Event Log<span class="badge" id="badge-phase">init</span></div>
+<div class="pane-body"><ul id="log-list"></ul></div>
+</div>
+</div>
+<div id="statusbar">
+<div class="sb-item">Franz</div>
+<div class="sb-item">phase: <span class="sb-phase" id="sb-phase">--</span></div>
+<div class="sb-item">turn: <span id="sb-turn">0</span></div>
+<div class="sb-item">seq: <span id="sb-seq">--</span></div>
+<div class="sb-item" id="sb-error" style="color:var(--err);display:none"></div>
+</div>
+<script type="module">
+'use strict';
+
+const NORM = 1000;
+const POLL_INTERVAL_MS = 400;
+const MAX_LOG_ENTRIES = 200;
+
+const logList = document.getElementById('log-list');
+function uiLog(message, level = 'info') {
+    const listItem = document.createElement('li');
+    listItem.className = level;
+    const timeEl = document.createElement('time');
+    timeEl.textContent = new Date().toLocaleTimeString('en-GB', {hour12: false});
+    listItem.appendChild(timeEl);
+    listItem.appendChild(document.createTextNode(message));
+    logList.prepend(listItem);
+    while (logList.children.length > MAX_LOG_ENTRIES) logList.removeChild(logList.lastChild);
+}
+
+const rootEl = document.getElementById('root');
+let splitX = parseFloat(localStorage.getItem('fsx') || '62');
+let splitY = parseFloat(localStorage.getItem('fsy') || '55');
+function applyLayout() {
+    rootEl.style.gridTemplateColumns = splitX + '% 4px 1fr';
+    rootEl.style.gridTemplateRows = splitY + '% 4px 1fr';
+}
+applyLayout();
+
+function dragger(handler) {
+    return function(event) {
+        event.preventDefault();
+        const onMove = (moveEvent) => handler(moveEvent);
+        const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+    };
+}
+document.getElementById('gutter-v').addEventListener('mousedown', dragger((event) => {
+    splitX = Math.max(15, Math.min(85, (event.clientX / innerWidth) * 100));
+    localStorage.setItem('fsx', splitX); applyLayout(); fitCanvas();
+}));
+document.getElementById('gutter-h').addEventListener('mousedown', dragger((event) => {
+    splitY = Math.max(15, Math.min(85, (event.clientY / innerHeight) * 100));
+    localStorage.setItem('fsy', splitY); applyLayout(); fitCanvas();
+}));
+document.getElementById('cross').addEventListener('mousedown', dragger((event) => {
+    splitX = Math.max(15, Math.min(85, (event.clientX / innerWidth) * 100));
+    splitY = Math.max(15, Math.min(85, (event.clientY / innerHeight) * 100));
+    localStorage.setItem('fsx', splitX); localStorage.setItem('fsy', splitY); applyLayout(); fitCanvas();
+}));
+
+const cBase = document.getElementById('c-base');
+const cOverlay = document.getElementById('c-overlay');
+const canvasStack = document.getElementById('canvas-stack');
+const canvasWrap = document.getElementById('canvas-wrap');
+const ctxBase = cBase.getContext('2d');
+const ctxOvl = cOverlay.getContext('2d');
+
+let canvasW = 0;
+let canvasH = 0;
+const pxFromNorm = (normVal) => (Number(normVal) || 0) * canvasW / NORM;
+const pyFromNorm = (normVal) => (Number(normVal) || 0) * canvasH / NORM;
+
+function resizeCanvases(width, height) {
+    if (canvasW === width && canvasH === height) return;
+    canvasW = width;
+    canvasH = height;
+    [cBase, cOverlay].forEach((canvas) => { canvas.width = width; canvas.height = height; });
+    canvasStack.style.width = width + 'px';
+    canvasStack.style.height = height + 'px';
+}
+
+function fitCanvas() {
+    if (!canvasW || !canvasH) return;
+    const wrapW = canvasWrap.clientWidth - 4;
+    const wrapH = canvasWrap.clientHeight - 4;
+    const scale = Math.min(wrapW / canvasW, wrapH / canvasH, 1);
+    const displayW = Math.round(canvasW * scale);
+    const displayH = Math.round(canvasH * scale);
+    canvasStack.style.width = displayW + 'px';
+    canvasStack.style.height = displayH + 'px';
+    [cBase, cOverlay].forEach((canvas) => { canvas.style.width = displayW + 'px'; canvas.style.height = displayH + 'px'; });
+}
+window.addEventListener('resize', fitCanvas);
+
+function drawPolygon(ctx, overlay) {
+    const points = (overlay.points || []).map((point) => [pxFromNorm(point[0]), pyFromNorm(point[1])]);
+    if (!points.length) return;
+    const opacity = Number(overlay.opacity ?? 1);
+    if (opacity < 0.02) return;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0, Math.min(1, opacity));
+    if (overlay.glow) { ctx.shadowColor = overlay.stroke || '#00eeff'; ctx.shadowBlur = 12; }
+    if (points.length > 1) {
+        ctx.beginPath();
+        ctx.moveTo(points[0][0], points[0][1]);
+        for (let idx = 1; idx < points.length; idx++) ctx.lineTo(points[idx][0], points[idx][1]);
+        if (overlay.closed) ctx.closePath();
+        if (overlay.fill) { ctx.fillStyle = overlay.fill; ctx.fill(); }
+        if (overlay.stroke) {
+            ctx.strokeStyle = overlay.stroke;
+            ctx.lineWidth = overlay.stroke_width || 1;
+            if (overlay.dash) ctx.setLineDash(overlay.dash);
+            else ctx.setLineDash([]);
+            ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+            ctx.stroke();
+        }
+    }
+    ctx.shadowColor = 'transparent'; ctx.shadowBlur = 0;
+    if (overlay.label) {
+        const labelStyle = overlay.label_style || {};
+        const labelPos = overlay.label_position || (points.length > 0 ? points[0] : [0, 0]);
+        const labelX = pxFromNorm(labelPos[0]);
+        const labelY = pyFromNorm(labelPos[1]);
+        const fontSize = labelStyle.font_size || 10;
+        const padding = 4;
+        const textAlign = labelStyle.align || 'left';
+        ctx.font = 'bold ' + fontSize + 'px system-ui,sans-serif';
+        ctx.textBaseline = 'top';
+        ctx.textAlign = textAlign;
+        if (labelStyle.bg) {
+            const textWidth = Math.ceil(ctx.measureText(overlay.label).width) + padding * 2;
+            const textHeight = fontSize + padding * 2;
+            let boxX = textAlign === 'center' ? labelX - textWidth / 2 : textAlign === 'right' ? labelX - textWidth : labelX;
+            boxX = Math.max(0, Math.min(canvasW - textWidth, boxX));
+            const boxY = Math.max(0, Math.min(canvasH - textHeight, labelY));
+            ctx.fillStyle = labelStyle.bg;
+            ctx.globalAlpha = Math.max(0, Math.min(1, opacity * 0.7));
+            ctx.fillRect(boxX, boxY, textWidth, textHeight);
+            ctx.globalAlpha = Math.max(0, Math.min(1, opacity));
+            ctx.fillStyle = labelStyle.color || '#ffffff';
+            ctx.fillText(overlay.label, textAlign === 'center' ? labelX : textAlign === 'right' ? labelX - padding : boxX + padding, boxY + padding);
+        } else {
+            ctx.fillStyle = labelStyle.color || '#ffffff';
+            ctx.fillText(overlay.label, labelX, labelY);
+        }
+    }
+    ctx.restore();
+}
+
+function renderOverlays(overlays) {
+    ctxOvl.clearRect(0, 0, canvasW, canvasH);
+    const sorted = [...overlays].sort((item_a, item_b) => (item_b.age || 0) - (item_a.age || 0));
+    for (const overlay of sorted) drawPolygon(ctxOvl, overlay);
+}
+
+function loadBaseImage(base64Data) {
+    return new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => {
+            resizeCanvases(image.naturalWidth, image.naturalHeight);
+            ctxBase.drawImage(image, 0, 0);
+            fitCanvas();
+            resolve();
+        };
+        image.onerror = reject;
+        image.src = 'data:image/png;base64,' + base64Data;
+    });
+}
+
+function exportAnnotated() {
+    const offscreen = new OffscreenCanvas(canvasW, canvasH);
+    const offCtx = offscreen.getContext('2d');
+    offCtx.drawImage(cBase, 0, 0);
+    offCtx.drawImage(cOverlay, 0, 0);
+    return new Promise((resolve) => {
+        offscreen.convertToBlob({type: 'image/png'}).then((blob) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result.split(',')[1]);
+            reader.readAsDataURL(blob);
+        });
+    });
+}
+
+const vlmOutput = document.getElementById('vlm-output');
+function renderDisplay(display) {
+    const escapeHtml = (text) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    if (!display || typeof display !== 'object') { vlmOutput.textContent = String(display || ''); return; }
+    const storyText = display.text || '';
+    const actions = display.actions || [];
+    const parseError = display.parse_error || '';
+    let html = '<div style="color:var(--text-mid);white-space:pre-wrap;word-break:break-word;margin-bottom:8px">' + escapeHtml(storyText) + '</div>';
+    if (parseError) {
+        html += '<div style="color:var(--err);font-size:11px;margin-bottom:6px">Parse error: ' + escapeHtml(parseError) + '</div>';
+    }
+    if (actions.length) {
+        html += '<div style="font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin:6px 0 2px;color:var(--accent2)">Actions (' + actions.length + ')</div>';
+        html += '<ul style="margin:0;padding:0 0 0 4px;list-style:none">';
+        for (const action of actions) {
+            const coords = action.bbox_2d || [];
+            const params = action.params ? ' ' + escapeHtml(String(action.params)) : '';
+            html += '<li style="color:#ffd080;padding:1px 0;font-size:11px">' + escapeHtml(action.type || '') + ' [' + coords.join(', ') + ']' + params + '</li>';
+        }
+        html += '</ul>';
+    }
+    vlmOutput.innerHTML = html;
+}
+
+function updateStatusBar(state) {
+    document.getElementById('sb-phase').textContent = state.phase ?? '--';
+    document.getElementById('sb-turn').textContent = state.turn ?? 0;
+    document.getElementById('sb-seq').textContent = state.pending_seq ?? '--';
+    const errorEl = document.getElementById('sb-error');
+    if (state.error) { errorEl.style.display = ''; errorEl.textContent = 'err: ' + state.error; }
+    else { errorEl.style.display = 'none'; }
+    const badgePhase = document.getElementById('badge-phase');
+    badgePhase.textContent = state.phase ?? '--';
+    badgePhase.className = state.phase === 'error' ? 'badge err' : state.phase === 'running' || state.phase === 'calling_vlm' ? 'badge ok' : 'badge warn';
+    document.getElementById('badge-turn').textContent = 'turn ' + state.turn;
+    document.getElementById('canvas-status').textContent = canvasW ? canvasW + 'x' + canvasH : 'no frame';
+}
+
+let lastMsgId = -1;
+let lastPendingSeq = -1;
+let isBusy = false;
+
+async function postAnnotated(seqNum, base64Data) {
+    try {
+        const response = await fetch('/annotated', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({seq: seqNum, image_b64: base64Data})
+        });
+        const result = await response.json();
+        uiLog('/annotated seq=' + seqNum + ' ok=' + result.ok, result.ok ? 'ok' : 'error');
+        return result.ok;
+    } catch (err) {
+        uiLog('/annotated fail: ' + err, 'error');
+        return false;
+    }
+}
+
+async function fetchFrame() {
+    try {
+        const response = await fetch('/frame');
+        return response.ok ? await response.json() : null;
+    } catch {
+        return null;
+    }
+}
+
+async function handleFrame(state) {
+    if (isBusy) return;
+    isBusy = true;
+    try {
+        const seqNum = state.pending_seq;
+        const frameData = await fetchFrame();
+        if (!frameData || !frameData.raw_b64 || frameData.raw_b64.length < 100) {
+            uiLog('frame fetch fail', 'error');
+            return;
+        }
+        document.getElementById('badge-img').textContent = 'seq ' + seqNum;
+        document.getElementById('badge-img').className = 'badge warn';
+        await loadBaseImage(frameData.raw_b64);
+        renderOverlays(frameData.overlays || []);
+        if (state.display) renderDisplay(state.display);
+        const annotatedBase64 = await exportAnnotated();
+        uiLog('exported ann len=' + annotatedBase64.length, 'ok');
+        const success = await postAnnotated(seqNum, annotatedBase64);
+        document.getElementById('badge-img').textContent = success ? 'seq ' + seqNum + ' ok' : 'seq ' + seqNum + ' fail';
+        document.getElementById('badge-img').className = success ? 'badge ok' : 'badge err';
+    } catch (err) {
+        uiLog('frame err: ' + err, 'error');
+    } finally {
+        isBusy = false;
+    }
+}
+
+async function poll() {
+    try {
+        const response = await fetch('/state');
+        if (!response.ok) { uiLog('/state ' + response.status, 'warn'); return; }
+        const state = await response.json();
+        updateStatusBar(state);
+        if (state.msg_id !== lastMsgId && state.display) {
+            lastMsgId = state.msg_id;
+            renderDisplay(state.display);
+        }
+        if (state.phase === 'waiting_annotated' && state.pending_seq > 0 && state.pending_seq !== lastPendingSeq) {
+            lastPendingSeq = state.pending_seq;
+            await handleFrame(state);
+        }
+    } catch (err) {
+        uiLog('poll: ' + err, 'warn');
+    }
+}
+setInterval(poll, POLL_INTERVAL_MS);
+
+uiLog('Franz panel starting', 'info');
+</script>
+</body>
+</html>
