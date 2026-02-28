@@ -19,6 +19,7 @@ class Win32Config:
     type_down_delay: float = 0.01
     hotkey_inter_delay: float = 0.02
     scroll_click_delay: float = 0.03
+    scroll_default_clicks: int = 3
     double_click_inter: float = 0.05
     overlay_alpha: int = 90
     selector_min_size: int = 5
@@ -82,6 +83,9 @@ PS_SOLID: int = 0
 PS_DASH: int = 1
 TRANSPARENT_BK: int = 1
 NULL_BRUSH: int = 5
+
+EXIT_OK: int = 0
+EXIT_CANCEL: int = 2
 
 LRESULT = ctypes.c_ssize_t
 WNDPROC_TYPE = ctypes.WINFUNCTYPE(LRESULT, W.HWND, W.UINT, W.WPARAM, W.LPARAM)
@@ -281,6 +285,13 @@ def _parse_region(region_str: str) -> tuple[int, int, int, int]:
     return int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
 
 
+def _parse_pos(pos_str: str) -> tuple[int, int]:
+    parts: list[str] = pos_str.split(",")
+    if len(parts) != 2:
+        raise ValueError(f"pos must be x,y got: {pos_str}")
+    return int(parts[0]), int(parts[1])
+
+
 def _norm_region_to_pixels(
     norm_x1: int, norm_y1: int, norm_x2: int, norm_y2: int,
     base_w: int, base_h: int,
@@ -449,11 +460,12 @@ def _do_capture(region_str: str, width: int, height: int) -> bytes:
     return _bgra_to_png(bgra, src_w, src_h)
 
 
-def _bbox_center(bbox_str: str) -> tuple[int, int]:
-    parts: list[str] = bbox_str.split(",")
-    if len(parts) != 4:
-        raise ValueError(f"bbox must be x1,y1,x2,y2 got: {bbox_str}")
-    return (int(parts[0]) + int(parts[2])) // 2, (int(parts[1]) + int(parts[3])) // 2
+def _resolve_screen_pos(norm_x: int, norm_y: int, region_str: str) -> tuple[int, int]:
+    if region_str:
+        rx1, ry1, rx2, ry2 = _parse_region(region_str)
+    else:
+        rx1, ry1, rx2, ry2 = 0, 0, NORM, NORM
+    return _norm_to_screen_pixel(norm_x, norm_y, rx1, ry1, rx2, ry2)
 
 
 def _move_cursor(pixel_x: int, pixel_y: int) -> None:
@@ -473,17 +485,9 @@ def _key_event(vk_code: int, is_up: bool = False) -> None:
     _user32.keybd_event(vk_code, 0, flags, None)
 
 
-def _resolve_screen_pos(bbox_str: str, region_str: str) -> tuple[int, int]:
-    norm_cx, norm_cy = _bbox_center(bbox_str)
-    if region_str:
-        rx1, ry1, rx2, ry2 = _parse_region(region_str)
-    else:
-        rx1, ry1, rx2, ry2 = 0, 0, NORM, NORM
-    return _norm_to_screen_pixel(norm_cx, norm_cy, rx1, ry1, rx2, ry2)
-
-
-def _do_click(bbox_str: str, region_str: str) -> None:
-    pixel_x, pixel_y = _resolve_screen_pos(bbox_str, region_str)
+def _do_click(pos_str: str, region_str: str) -> None:
+    norm_x, norm_y = _parse_pos(pos_str)
+    pixel_x, pixel_y = _resolve_screen_pos(norm_x, norm_y, region_str)
     _move_cursor(pixel_x, pixel_y)
     time.sleep(CONFIG.click_settle_delay)
     _mouse_event(LEFT_DOWN)
@@ -491,8 +495,9 @@ def _do_click(bbox_str: str, region_str: str) -> None:
     _mouse_event(LEFT_UP)
 
 
-def _do_double_click(bbox_str: str, region_str: str) -> None:
-    pixel_x, pixel_y = _resolve_screen_pos(bbox_str, region_str)
+def _do_double_click(pos_str: str, region_str: str) -> None:
+    norm_x, norm_y = _parse_pos(pos_str)
+    pixel_x, pixel_y = _resolve_screen_pos(norm_x, norm_y, region_str)
     _move_cursor(pixel_x, pixel_y)
     time.sleep(CONFIG.click_settle_delay)
     _mouse_event(LEFT_DOWN)
@@ -504,8 +509,9 @@ def _do_double_click(bbox_str: str, region_str: str) -> None:
     _mouse_event(LEFT_UP)
 
 
-def _do_right_click(bbox_str: str, region_str: str) -> None:
-    pixel_x, pixel_y = _resolve_screen_pos(bbox_str, region_str)
+def _do_right_click(pos_str: str, region_str: str) -> None:
+    norm_x, norm_y = _parse_pos(pos_str)
+    pixel_x, pixel_y = _resolve_screen_pos(norm_x, norm_y, region_str)
     _move_cursor(pixel_x, pixel_y)
     time.sleep(CONFIG.click_settle_delay)
     _mouse_event(RIGHT_DOWN)
@@ -573,8 +579,9 @@ def _do_hotkey(keys_str: str) -> None:
         time.sleep(CONFIG.hotkey_inter_delay)
 
 
-def _do_scroll(bbox_str: str, region_str: str, direction: int, clicks: int) -> None:
-    pixel_x, pixel_y = _resolve_screen_pos(bbox_str, region_str)
+def _do_scroll(pos_str: str, region_str: str, direction: int, clicks: int) -> None:
+    norm_x, norm_y = _parse_pos(pos_str)
+    pixel_x, pixel_y = _resolve_screen_pos(norm_x, norm_y, region_str)
     _move_cursor(pixel_x, pixel_y)
     time.sleep(CONFIG.click_settle_delay)
     for _ in range(max(1, clicks)):
@@ -582,9 +589,11 @@ def _do_scroll(bbox_str: str, region_str: str, direction: int, clicks: int) -> N
         time.sleep(CONFIG.scroll_click_delay)
 
 
-def _do_drag(bbox_from_str: str, bbox_to_str: str, region_str: str) -> None:
-    from_x, from_y = _resolve_screen_pos(bbox_from_str, region_str)
-    to_x, to_y = _resolve_screen_pos(bbox_to_str, region_str)
+def _do_drag(from_pos_str: str, to_pos_str: str, region_str: str) -> None:
+    from_nx, from_ny = _parse_pos(from_pos_str)
+    to_nx, to_ny = _parse_pos(to_pos_str)
+    from_x, from_y = _resolve_screen_pos(from_nx, from_ny, region_str)
+    to_x, to_y = _resolve_screen_pos(to_nx, to_ny, region_str)
     steps: int = max(1, CONFIG.drag_step_count)
     _move_cursor(from_x, from_y)
     time.sleep(CONFIG.click_settle_delay)
@@ -597,25 +606,6 @@ def _do_drag(bbox_from_str: str, bbox_to_str: str, region_str: str) -> None:
         time.sleep(CONFIG.drag_step_delay)
     time.sleep(CONFIG.click_settle_delay)
     _mouse_event(LEFT_UP)
-
-
-def _do_compare(file_a: str, file_b: str) -> float:
-    from pathlib import Path as _Path
-    data_a: bytes = _Path(file_a).read_bytes()
-    data_b: bytes = _Path(file_b).read_bytes()
-    if len(data_a) != len(data_b) or len(data_a) == 0:
-        return -1.0
-    step: int = 64
-    diff: int = 0
-    total: int = 0
-    view_a: memoryview = memoryview(data_a)
-    view_b: memoryview = memoryview(data_b)
-    for byte_idx in range(0, len(view_b) - 3, step):
-        diff += abs(view_b[byte_idx + 0] - view_a[byte_idx + 0])
-        diff += abs(view_b[byte_idx + 1] - view_a[byte_idx + 1])
-        diff += abs(view_b[byte_idx + 2] - view_a[byte_idx + 2])
-        total += 3 * 255
-    return (diff / total) if total else -1.0
 
 
 def _do_cursor_pos(region_str: str) -> str:
@@ -634,6 +624,7 @@ _selector_sx: int = 0
 _selector_sy: int = 0
 _selector_ex: int = 0
 _selector_ey: int = 0
+_selector_exit_code: int = EXIT_CANCEL
 _selector_result: tuple[int, int, int, int] | None = None
 _selector_wndproc_ref: WNDPROC_TYPE | None = None
 _selector_screen_w: int = 0
@@ -653,21 +644,24 @@ def _selector_get_xy(lparam: int) -> tuple[int, int]:
 
 def _selector_wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
     global _selector_dragging, _selector_sx, _selector_sy
-    global _selector_ex, _selector_ey, _selector_result
+    global _selector_ex, _selector_ey, _selector_result, _selector_exit_code
 
     if msg == WM_ERASEBKGND:
         return 1
     if msg == WM_KEYDOWN:
         if int(wparam) == VK_ESCAPE:
             _selector_result = None
+            _selector_exit_code = EXIT_CANCEL
             _user32.DestroyWindow(hwnd)
             return 0
     if msg == WM_RBUTTONDOWN:
         _selector_result = None
+        _selector_exit_code = EXIT_OK
         _user32.DestroyWindow(hwnd)
         return 0
     if msg == WM_CLOSE:
         _selector_result = None
+        _selector_exit_code = EXIT_CANCEL
         _user32.DestroyWindow(hwnd)
         return 0
     if msg == WM_LBUTTONDOWN:
@@ -694,6 +688,7 @@ def _selector_wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
             if (abs(rect_x2 - rect_x1) > CONFIG.selector_min_size
                     and abs(rect_y2 - rect_y1) > CONFIG.selector_min_size):
                 _selector_result = (rect_x1, rect_y1, rect_x2, rect_y2)
+                _selector_exit_code = EXIT_OK
                 _user32.DestroyWindow(hwnd)
             else:
                 _user32.InvalidateRect(hwnd, None, True)
@@ -730,8 +725,8 @@ def _selector_wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
     return int(_user32.DefWindowProcW(hwnd, msg, wparam, lparam))
 
 
-def _do_select_region() -> str:
-    global _selector_wndproc_ref, _selector_result
+def _do_select_region() -> tuple[str, int]:
+    global _selector_wndproc_ref, _selector_result, _selector_exit_code
     global _selector_screen_w, _selector_screen_h, _selector_null_brush
     global _selector_dragging, _selector_sx, _selector_sy
     global _selector_ex, _selector_ey
@@ -742,6 +737,7 @@ def _do_select_region() -> str:
     _selector_ex = 0
     _selector_ey = 0
     _selector_result = None
+    _selector_exit_code = EXIT_CANCEL
 
     _selector_screen_w, _selector_screen_h = _screen_size()
 
@@ -769,7 +765,7 @@ def _do_select_region() -> str:
     if not atom:
         last_err: int = ctypes.get_last_error()
         if last_err != 1410:
-            return ""
+            return "", EXIT_CANCEL
 
     ex_style: int = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW
     hwnd: int = _user32.CreateWindowExW(
@@ -779,7 +775,7 @@ def _do_select_region() -> str:
         None, None, hinst, None,
     )
     if not hwnd:
-        return ""
+        return "", EXIT_CANCEL
 
     _user32.SetLayeredWindowAttributes(hwnd, 0, CONFIG.overlay_alpha, LWA_ALPHA)
     _user32.SetForegroundWindow(hwnd)
@@ -799,8 +795,8 @@ def _do_select_region() -> str:
         norm_y1: int = max(0, min(NORM, round(px_y1 * NORM / _selector_screen_h)))
         norm_x2: int = max(0, min(NORM, round(px_x2 * NORM / _selector_screen_w)))
         norm_y2: int = max(0, min(NORM, round(px_y2 * NORM / _selector_screen_h)))
-        return f"{norm_x1},{norm_y1},{norm_x2},{norm_y2}"
-    return ""
+        return f"{norm_x1},{norm_y1},{norm_x2},{norm_y2}", EXIT_OK
+    return "", _selector_exit_code
 
 
 def main() -> None:
@@ -829,19 +825,19 @@ def main() -> None:
             sys.stdout.buffer.flush()
 
         case "click":
-            bbox_arg: str = get_arg("bbox", "500,500,500,500")
+            pos_arg: str = get_arg("pos", "500,500")
             region_val: str = get_arg("region", "")
-            _do_click(bbox_arg, region_val)
+            _do_click(pos_arg, region_val)
 
         case "double_click":
-            bbox_arg = get_arg("bbox", "500,500,500,500")
+            pos_arg = get_arg("pos", "500,500")
             region_val = get_arg("region", "")
-            _do_double_click(bbox_arg, region_val)
+            _do_double_click(pos_arg, region_val)
 
         case "right_click":
-            bbox_arg = get_arg("bbox", "500,500,500,500")
+            pos_arg = get_arg("pos", "500,500")
             region_val = get_arg("region", "")
-            _do_right_click(bbox_arg, region_val)
+            _do_right_click(pos_arg, region_val)
 
         case "type_text":
             text_arg: str = get_arg("text", "")
@@ -856,29 +852,22 @@ def main() -> None:
             _do_hotkey(keys_arg)
 
         case "scroll_up":
-            bbox_arg = get_arg("bbox", "500,500,500,500")
+            pos_arg = get_arg("pos", "500,500")
             region_val = get_arg("region", "")
-            clicks_arg: int = int(get_arg("clicks", "3"))
-            _do_scroll(bbox_arg, region_val, 1, clicks_arg)
+            clicks_arg: int = int(get_arg("clicks", str(CONFIG.scroll_default_clicks)))
+            _do_scroll(pos_arg, region_val, 1, clicks_arg)
 
         case "scroll_down":
-            bbox_arg = get_arg("bbox", "500,500,500,500")
+            pos_arg = get_arg("pos", "500,500")
             region_val = get_arg("region", "")
-            clicks_arg = int(get_arg("clicks", "3"))
-            _do_scroll(bbox_arg, region_val, -1, clicks_arg)
+            clicks_arg = int(get_arg("clicks", str(CONFIG.scroll_default_clicks)))
+            _do_scroll(pos_arg, region_val, -1, clicks_arg)
 
         case "drag":
-            bbox_from: str = get_arg("from", "400,400,410,410")
-            bbox_to: str = get_arg("to", "600,600,610,610")
+            from_pos_arg: str = get_arg("from_pos", "400,400")
+            to_pos_arg: str = get_arg("to_pos", "600,600")
             region_val = get_arg("region", "")
-            _do_drag(bbox_from, bbox_to, region_val)
-
-        case "compare":
-            file_a: str = get_arg("file_a", "")
-            file_b: str = get_arg("file_b", "")
-            ratio: float = _do_compare(file_a, file_b)
-            sys.stdout.write(f"{ratio:.6f}\n")
-            sys.stdout.flush()
+            _do_drag(from_pos_arg, to_pos_arg, region_val)
 
         case "cursor_pos":
             region_val = get_arg("region", "")
@@ -887,12 +876,13 @@ def main() -> None:
             sys.stdout.flush()
 
         case "select_region":
-            coords = _do_select_region()
-            if coords:
-                sys.stdout.write(coords + "\n")
+            region_result, code = _do_select_region()
+            if code == EXIT_CANCEL:
+                raise SystemExit(EXIT_CANCEL)
+            if region_result:
+                sys.stdout.write(region_result + "\n")
                 sys.stdout.flush()
-            else:
-                raise SystemExit(1)
+            raise SystemExit(EXIT_OK)
 
         case _:
             sys.stderr.write(f"unknown command: {command}\n")
